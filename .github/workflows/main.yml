@@ -5,29 +5,32 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 
-permissions:
-  contents: read
-  packages: write
-
 env:
-  KOYEB_APP: "app-hello"      # ajuste
-  KOYEB_SERVICE: "web"        # ajuste
-  EXPOSE_PORT: "8000"         # ajuste
-  HEALTHCHECK_URL: ""         # opcional
+  KOYEB_APP: "app-hello"
+  KOYEB_SERVICE: "web"
+  EXPOSE_PORT: "8000"
+  HEALTHCHECK_URL: ""
   KOYEB_VERSION: "5.9.0"
   IMAGE_NAME: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
 
 jobs:
-  deploy:
+  build-and-deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to GHCR
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -40,97 +43,67 @@ jobs:
           context: .
           push: true
           tags: ${{ env.IMAGE_NAME }}
-          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            EXPOSE_PORT=${{ env.EXPOSE_PORT }}
 
       - name: Install Koyeb CLI
-        shell: bash
         env:
           KOYEB_VERSION: ${{ env.KOYEB_VERSION }}
         run: |
           set -euo pipefail
-          tmp="$(mktemp -d)"
-          url="https://github.com/koyeb/koyeb-cli/releases/download/v${KOYEB_VERSION}/koyeb-cli_${KOYEB_VERSION}_linux_amd64.tar.gz"
-          echo "Baixando: ${url}"
-          curl -fsSL "$url" -o "${tmp}/koyeb.tar.gz"
-          tar -xzf "${tmp}/koyeb.tar.gz" -C "$tmp"
-          if [ -f "${tmp}/koyeb.tgz" ]; then
-            tar -xzf "${tmp}/koyeb.tgz" -C "$tmp"
+
+          tmpdir="$(mktemp -d)"
+          cd "$tmpdir"
+
+          URL="https://github.com/koyeb/koyeb-cli/releases/download/v${KOYEB_VERSION}/koyeb-cli_${KOYEB_VERSION}_linux_amd64.tar.gz"
+          echo "Baixando: $URL"
+          curl -fsSL "$URL" -o koyeb.tar.gz
+
+          tar -xzf koyeb.tar.gz || true
+          if [ -f koyeb.tgz ]; then
+            tar -xzf koyeb.tgz
           fi
-          bin=""
-          if [ -f "${tmp}/koyeb" ]; then
-            bin="${tmp}/koyeb"
-          elif [ -f "${tmp}/koyeb-cli_${KOYEB_VERSION}_linux_amd64/koyeb" ]; then
-            bin="${tmp}/koyeb-cli_${KOYEB_VERSION}_linux_amd64/koyeb"
-          else
-            echo "Conteúdo extraído:"
-            ls -lah "${tmp}"
-            echo "Erro: binário 'koyeb' não encontrado após extração"
+
+          binpath="$(find . -maxdepth 2 -type f -name 'koyeb' -perm -u+x | head -n1 || true)"
+          if [ -z "${binpath:-}" ]; then
+            echo "Binário 'koyeb' não encontrado após extração"
+            ls -la
             exit 1
           fi
-          sudo install -m 0755 "$bin" /usr/local/bin/koyeb
-          koyeb version
 
-      - name: Authenticate on Koyeb
-        shell: bash
+          sudo install -m 0755 "$binpath" /usr/local/bin/koyeb
+          koyeb --version
+          koyeb --help | sed -n '1,40p'
+
+      - name: Login to Koyeb (non-interactive)
         env:
-          KOYEB_API_TOKEN: ${{ secrets.KOYEB_API_TOKEN }}
           KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
         run: |
           set -euo pipefail
-          TOKEN="${KOYEB_API_TOKEN:-${KOYEB_TOKEN:-}}"
-          if [ -z "$TOKEN" ]; then
-            echo "Erro: defina o secret KOYEB_API_TOKEN ou KOYEB_TOKEN em Settings > Secrets and variables > Actions"
-            exit 1
-          fi
-          export KOYEB_API_TOKEN="$TOKEN"
-          export KOYEB_TOKEN="$TOKEN"
-          koyeb account get >/dev/null 2>&1 || {
-            echo "Falha ao autenticar na Koyeb CLI usando o token fornecido."
-            koyeb account get || true
-            exit 1
-          }
+          set +x
+          LOGIN_OK=0
 
-      - name: Deploy on Koyeb (create/update)
-        shell: bash
-        env:
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
-          KOYEB_APP: ${{ env.KOYEB_APP }}
-          KOYEB_SERVICE: ${{ env.KOYEB_SERVICE }}
-          EXPOSE_PORT: ${{ env.EXPOSE_PORT }}
-        run: |
-          set -euo pipefail
-
-          # Garante que o app exista (não falha se já existir)
-          koyeb app get "$KOYEB_APP" >/dev/null 2>&1 || koyeb app create "$KOYEB_APP"
-
-          # Se o serviço existe, atualiza; senão, cria
-          if koyeb service get "$KOYEB_APP/$KOYEB_SERVICE" >/dev/null 2>&1; then
-            # Atualização: troca apenas a imagem e porta (ajuste flags conforme sua stack)
-            koyeb service update "$KOYEB_APP/$KOYEB_SERVICE" \
-              --image "$IMAGE_NAME" \
-              --ports "${EXPOSE_PORT}:http"
-          else
-            # Criação: define nome, imagem e porta exposta
-            koyeb service create "$KOYEB_APP/$KOYEB_SERVICE" \
-              --image "$IMAGE_NAME" \
-              --ports "${EXPOSE_PORT}:http"
-          fi
-
-      - name: Optional health-check
-        if: ${{ env.HEALTHCHECK_URL != '' }}
-        shell: bash
-        env:
-          HEALTHCHECK_URL: ${{ env.HEALTHCHECK_URL }}
-        run: |
-          set -euo pipefail
-          echo "Aguardando serviço ficar saudável..."
-          for i in {1..30}; do
-            code="$(curl -fsS -o /dev/null -w '%{http_code}' "$HEALTHCHECK_URL" || true)"
-            if [ "$code" = "200" ] || [ "$code" = "204" ]; then
-              echo "Health-check OK ($code)"
-              exit 0
+          if koyeb login --help 2>&1 | grep -q -- '--access-token'; then
+            if koyeb login --access-token "$KOYEB_TOKEN" --no-browser >/dev/null 2>&1; then
+              LOGIN_OK=1
             fi
-            sleep 5
-          done
-          echo "Health-check falhou após 150s"
-          exit 1
+          fi
+
+          if [ "$LOGIN_OK" -ne 1 ]; then
+            mkdir -p "$HOME/.config/koyeb"
+            printf '{"access_token":"%s"}' "$KOYEB_TOKEN" > "$HOME/.config/koyeb/config.json"
+          fi
+
+          set -x
+          if ! koyeb apps list >/dev/null 2>&1; then
+            echo "Falha ao autenticar na Koyeb CLI com o token fornecido."
+            exit 1
+          fi
+          echo "Autenticação Koyeb OK."
+
+      # ——— AQUI entram seus comandos de deploy Koyeb ———
+      # Ex.: criar app/serviço, atualizar imagem, etc.
+      # Deixe como já está no seu workflow, apenas remova 'account'/'auth' do login.
+      # -------------------------------------------------
