@@ -1,14 +1,27 @@
-name: ci-cd-koyeb
+name: CI/CD Koyeb
 
 on:
   push:
-    branches: ["main"]
-  pull_request:
-    branches: ["main"]
+    branches: [ "main" ]
+    tags: [ "v*.*.*" ]
+  workflow_dispatch:
 
 permissions:
   contents: read
   packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }} # Ex.: owner/repo
+  # Ajuste estes três conforme sua app:
+  KOYEB_APP: myapp
+  KOYEB_SERVICE: web
+  EXPOSE_PORT: "8080"       # porta que seu container expõe internamente
+  PORT_MAPPING: "${{ env.EXPOSE_PORT }}:http"  # mapeamento padrão http
+  # Opcional: HEALTHCHECK_URL via secret. Se vazio, health-check é pulado.
+  # Exemplo de secret: https://<seu-dominio-ou-subdominio>
+  # Coloque esse secret em Settings > Secrets and variables > Actions
+  # HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
 
 jobs:
   build-and-deploy:
@@ -18,126 +31,180 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Definir variáveis (owner minúsculo, imagem e tags)
-        id: vars
-        shell: bash
-        run: |
-          set -euo pipefail
-          OWNER="${GITHUB_REPOSITORY_OWNER}"
-          OWNER_LC="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
-          echo "OWNER_LC=$OWNER_LC" >> "$GITHUB_ENV"
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
-          IMAGE="ghcr.io/${OWNER_LC}/app-hello"
-          TAG_SHA="${GITHUB_SHA::7}"
-          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
-          echo "TAG_SHA=$TAG_SHA" >> "$GITHUB_ENV"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Login no GHCR
-        if: github.event_name == 'push'
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ github.token }}
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build da imagem (local)
-        shell: bash
+      - name: Derive image tags
+        id: vars
         run: |
           set -euo pipefail
-          docker build \
-            -t "${IMAGE}:latest" \
-            -t "${IMAGE}:${TAG_SHA}" \
+          # Tag principal baseada no nome do ref (branch/tag) com barras substituídas
+          REF_SLUG="${GITHUB_REF_NAME//\//-}"
+          SHA_SHORT="$(git rev-parse --short HEAD)"
+          echo "ref_slug=$REF_SLUG" >> "$GITHUB_OUTPUT"
+          echo "sha_short=$SHA_SHORT" >> "$GITHUB_OUTPUT"
+          # Decide tags:
+          # - Para tag semântica (vX.Y.Z): usa a tag
+          # - Para main: usa 'latest' e também 'main'
+          # - Para outras branches: usa o slug da branch
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "image_tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "extra_tag=" >> "$GITHUB_OUTPUT"
+          else
+            if [[ "${GITHUB_REF_NAME}" == "main" ]]; then
+              echo "image_tag=latest" >> "$GITHUB_OUTPUT"
+              echo "extra_tag=main" >> "$GITHUB_OUTPUT"
+            else
+              echo "image_tag=${REF_SLUG}" >> "$GITHUB_OUTPUT"
+              echo "extra_tag=" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Build and push image
+        run: |
+          set -euo pipefail
+          IMAGE_URI="${REGISTRY}/${IMAGE_NAME}:${{ steps.vars.outputs.image_tag }}"
+          docker buildx build \
+            --platform linux/amd64 \
+            -t "${IMAGE_URI}" \
+            --push \
             .
+          if [[ -n "${{ steps.vars.outputs.extra_tag }}" ]]; then
+            EXTRA_URI="${REGISTRY}/${IMAGE_NAME}:${{ steps.vars.outputs.extra_tag }}"
+            docker buildx build \
+              --platform linux/amd64 \
+              -t "${EXTRA_URI}" \
+              --push \
+              .
+          fi
+          echo "IMAGE_URI=${IMAGE_URI}" >> "$GITHUB_ENV"
 
-      - name: Push da imagem (somente push em main)
-        if: github.event_name == 'push'
-        shell: bash
+      - name: Install Koyeb CLI (latest, Linux x86_64/amd64)
         run: |
           set -euo pipefail
-          docker push "${IMAGE}:latest"
-          docker push "${IMAGE}:${TAG_SHA}"
-
-      - name: Instalar Koyeb CLI (latest, OS/arch auto)
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          sudo apt-get update -y
-          sudo apt-get install -y curl jq tar
-          OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
-          ARCH="$(uname -m)"
-          case "$ARCH" in
-            x86_64|amd64) A1="amd64"; A2="x86_64" ;;
-            aarch64|arm64) A1="arm64"; A2="arm64" ;;
-            *) echo "Arquitetura não suportada: $ARCH"; exit 1 ;;
-          esac
-          API_URL="https://api.github.com/repos/koyeb/koyeb-cli/releases/latest"
-          HDR_AUTH=()
-          if [ -n "${GH_TOKEN:-}" ]; then
-            HDR_AUTH=(-H "Authorization: Bearer ${GH_TOKEN}")
+          api='https://api.github.com/repos/koyeb/koyeb-cli/releases/latest'
+          url="$(curl -fsSL "$api" | jq -r '
+            .assets[]
+            | select((.name|test("(?i)linux")) and (.name|test("(?i)(amd64|x86_64|x64)")) and (.name|endswith(".tar.gz")))
+            | .browser_download_url
+          ' | head -n1)"
+          if [ -z "$url" ]; then
+            echo "Não encontrei asset do Koyeb CLI para Linux amd64/x86_64"; exit 1
           fi
-          JSON="$(curl -fsSL -H "Accept: application/vnd.github+json" "${HDR_AUTH[@]}" "$API_URL")"
-          DL_URL="$(echo "$JSON" \
-            | jq -r --arg os "$OS" --arg a1 "$A1" --arg a2 "$A2" '
-                .assets[]
-                | .name as $n
-                | select(
-                    ($n|ascii_downcase|contains($os))
-                    and (
-                      ($n|ascii_downcase|contains($a1))
-                      or ($n|ascii_downcase|contains($a2))
-                    )
-                    and ($n|endswith(".tar.gz"))
-                  )
-                | .browser_download_url
-              ' | head -n1)"
-          if [ -z "$DL_URL" ] || [ "$DL_URL" = "null" ]; then
-            echo "Não encontrei asset para $OS/$ARCH"
-            echo "$JSON" | jq -r '.assets[].name'
-            exit 1
-          fi
-          curl -fsSL "$DL_URL" -o /tmp/koyeb.tgz
+          echo "Baixando Koyeb CLI: $url"
+          curl -fsSL "$url" -o /tmp/koyeb.tgz
           tar -xzf /tmp/koyeb.tgz -C /tmp
-          sudo install -m 0755 "$(find /tmp -type f -name 'koyeb' | head -n1)" /usr/local/bin/koyeb
-          koyeb version
+          KOYEB_BIN="$(find /tmp -type f -name 'koyeb' -perm -u+x | head -n1 || true)"
+          if [ -z "$KOYEB_BIN" ]; then
+            echo "Binário 'koyeb' não encontrado no tarball"; exit 1
+          fi
+          sudo mv "$KOYEB_BIN" /usr/local/bin/koyeb
+          sudo chmod +x /usr/local/bin/koyeb
+          koyeb version || { echo "Koyeb CLI não executou"; exit 1; }
 
-      - name: Deploy no Koyeb (somente push em main)
-        if: github.event_name == 'push'
+      - name: Login Koyeb (non-interactive)
         env:
           KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
-          IMAGE: ${{ env.IMAGE }}
-          TAG_SHA: ${{ env.TAG_SHA }}
-        shell: bash
         run: |
           set -euo pipefail
-
           if [ -z "${KOYEB_TOKEN:-}" ]; then
-            echo "KOYEB_TOKEN não definido em Secrets."
-            exit 1
+            echo "Secret KOYEB_TOKEN não definido"; exit 1
           fi
-
-          # Login na Koyeb CLI
-          koyeb auth login --token "$KOYEB_TOKEN"
-
-          APP_NAME="app-hello"
-          SVC_NAME="web"
-          IMAGE_REF="${IMAGE}:latest"
-
-          # Se o app não existir, cria
-          if ! koyeb app get "$APP_NAME" >/dev/null 2>&1; then
-            koyeb app create "$APP_NAME"
-          fi
-
-          # Se o serviço não existir, cria. Caso exista, atualiza a imagem
-          if ! koyeb service get "$APP_NAME/$SVC_NAME" >/dev/null 2>&1; then
-            koyeb service create "$APP_NAME/$SVC_NAME" \
-              --docker "$IMAGE_REF" \
-              --ports 8080:http
+          # Fluxo 1: se a CLI tem 'login', usa token sem abrir browser
+          if koyeb help 2>&1 | grep -qE '\slogin\s'; then
+            koyeb login --token "$KOYEB_TOKEN" --no-browser
           else
-            koyeb service update "$APP_NAME/$SVC_NAME" \
-              --docker "$IMAGE_REF"
+            echo "Subcomando 'login' indisponível; usando variável de ambiente"
+            export KOYEB_API_TOKEN="$KOYEB_TOKEN"
+            export KOYEB_TOKEN="$KOYEB_TOKEN"
+          fi
+          # Sanity check
+          koyeb apps list >/dev/null
+
+      - name: Create app if missing
+        run: |
+          set -euo pipefail
+          if ! koyeb apps list | awk '{print $1}' | grep -qx "${KOYEB_APP}"; then
+            echo "App '${KOYEB_APP}' não existe. Criando..."
+            koyeb apps create "${KOYEB_APP}"
+          else
+            echo "App '${KOYEB_APP}' já existe."
           fi
 
-          # Opcional: aguardar rollout (descomente para bloquear até ficar saudável)
-          # koyeb service rollout status "$APP_NAME/$SVC_NAME" --watch --timeout 300
+      - name: Create or redeploy service
+        env:
+          IMAGE_URI: ${{ env.IMAGE_URI }}
+          # Opcional: defina ENV_VARS como KEY=VAL,KEY2=VAL2 (vírgula separando)
+          ENV_VARS: ${{ vars.KOYEB_ENV_VARS }}
+        run: |
+          set -euo pipefail
+          # Monta flags de env se houver ENV_VARS (KEY=VAL,KEY2=VAL2)
+          ENV_ARGS=()
+          if [[ -n "${ENV_VARS:-}" ]]; then
+            IFS=',' read -ra PAIRS <<< "$ENV_VARS"
+            for kv in "${PAIRS[@]}"; do
+              # Ignora pares vazios
+              [[ -z "$kv" ]] && continue
+              ENV_ARGS+=(--env "$kv")
+            done
+          fi
+
+          # Verifica se o serviço existe
+          if koyeb services list --app "${KOYEB_APP}" | awk '{print $1}' | grep -qx "${KOYEB_SERVICE}"; then
+            echo "Serviço '${KOYEB_SERVICE}' existe. Redeploy com a nova imagem..."
+            # Se a CLI suportar 'redeploy', usamos para trocar a imagem mantendo config
+            if koyeb services --help 2>&1 | grep -qE '\sredeploy\s'; then
+              koyeb services redeploy "${KOYEB_SERVICE}" \
+                --app "${KOYEB_APP}" \
+                --image "${IMAGE_URI}"
+            else
+              echo "Sem 'redeploy'. Tentando 'update' para apontar a nova imagem..."
+              koyeb services update "${KOYEB_SERVICE}" \
+                --app "${KOYEB_APP}" \
+                --image "${IMAGE_URI}"
+            fi
+          else
+            echo "Serviço '${KOYEB_SERVICE}' não existe. Criando..."
+            # Criação inicial com mapeamento de porta e envs
+            koyeb services create "${KOYEB_SERVICE}" \
+              --app "${KOYEB_APP}" \
+              --image "${IMAGE_URI}" \
+              --ports "${PORT_MAPPING}" \
+              "${ENV_ARGS[@]}"
+          fi
+
+      - name: Wait and health-check (optional)
+        env:
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+        run: |
+          set -euo pipefail
+          # Aguarda alguns segundos para o rollout inicial
+          sleep 10
+          if [[ -z "${HEALTHCHECK_URL:-}" ]]; then
+            echo "HEALTHCHECK_URL não definido. Pulando health-check."
+            exit 0
+          fi
+          echo "Executando health-check em ${HEALTHCHECK_URL}"
+          # retry com backoff simples
+          max=12
+          for i in $(seq 1 $max); do
+            code=$(curl -sk -o /dev/null -w "%{http_code}" "${HEALTHCHECK_URL}" || true)
+            if [[ "$code" =~ ^2|3[0-9]$ ]]; then
+              echo "Health-check OK (HTTP ${code})"
+              exit 0
+            fi
+            echo "Tentativa ${i}/${max}: HTTP ${code}. Aguardando..."
+            sleep 5
+          done
+          echo "Health-check falhou em ${HEALTHCHECK_URL}"
+          exit 1
