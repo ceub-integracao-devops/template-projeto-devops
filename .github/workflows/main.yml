@@ -19,17 +19,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Normalizar IMAGE_NAME (owner em minúsculas)
+        run: |
+          OWNER_LC="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          echo "OWNER_LC=$OWNER_LC" >> $GITHUB_ENV
+          echo "IMAGE_NAME=ghcr.io/$OWNER_LC/app-hello" >> $GITHUB_ENV
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Define IMAGE_NAME com o owner em minúsculas (requisito do GHCR)
-      - name: Definir IMAGE_NAME (owner em minúsculas para GHCR)
-        run: |
-          echo "IMAGE_NAME=ghcr.io/${OWNER,,}/app-hello" >> $GITHUB_ENV
-        env:
-          OWNER: ${{ github.repository_owner }}
-
-      # Login no GHCR apenas no push (evita erro em PRs de forks)
       - name: Login no GHCR
         if: github.event_name == 'push'
         uses: docker/login-action@v3
@@ -38,8 +36,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Em PR: apenas build (sem push). Em push: build + push.
-      - name: Build (e Push em push)
+      - name: Build (e Push se push)
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -48,60 +45,88 @@ jobs:
             ${{ env.IMAGE_NAME }}:latest
             ${{ env.IMAGE_NAME }}:${{ github.sha }}
 
-      # Instala a CLI do Koyeb (substitui a action inexistente)
-      - name: Instalar Koyeb CLI
-        if: github.event_name == 'push'
+      - name: Instalar Koyeb CLI (última release)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
-          KOYEB_VERSION: latest
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          sudo apt-get update -y
-          sudo apt-get install -y curl jq tar
 
-          VER="${KOYEB_VERSION:-latest}"
-          if [ "$VER" = "latest" ]; then
-            VER="$(curl -fsSL https://api.github.com/repos/koyeb/koyeb-cli/releases/latest | jq -r .tag_name | sed 's/^v//')"
-          fi
-
-          ARCH="$(uname -m)"
-          case "$ARCH" in
-            x86_64) ARCH="x86_64" ;;
-            aarch64|arm64) ARCH="arm64" ;;
-            *) echo "Arquitetura não suportada: $ARCH" >&2; exit 1 ;;
+          OS="linux"
+          ARCH_RAW="$(uname -m)"
+          case "$ARCH_RAW" in
+            x86_64|amd64) ARCH_PATS="x86_64|amd64" ;;
+            aarch64|arm64) ARCH_PATS="arm64|aarch64" ;;
+            *) echo "Arquitetura não suportada: $ARCH_RAW"; exit 1 ;;
           esac
 
-          URL="https://github.com/koyeb/koyeb-cli/releases/download/v${VER}/koyeb_${VER}_Linux_${ARCH}.tar.gz"
+          API_URL="https://api.github.com/repos/koyeb/koyeb-cli/releases/latest"
+          JSON="$(curl -sSL -H "Accept: application/vnd.github+json" \
+                          -H "User-Agent: gha-koyeb-installer" \
+                          -H "Authorization: Bearer ${GH_TOKEN}" \
+                          "$API_URL")"
+
+          URL="$(echo "$JSON" | jq -r \
+            --arg os "$OS" \
+            --arg pats "$ARCH_PATS" \
+            '[.assets[].browser_download_url
+              | select(test("(?i)"+$os) and test("(?i)("+$pats+")") and test("\.tar\.gz$"))
+            ][0] // empty')"
+
+          if [ -z "$URL" ]; then
+            echo "Não foi possível encontrar asset do Koyeb CLI para $OS ($ARCH_RAW)."
+            echo "Assets disponíveis:"
+            echo "$JSON" | jq -r '.assets[].browser_download_url'
+            exit 1
+          fi
+
           echo "Baixando Koyeb CLI: $URL"
-          curl -fsSL "$URL" -o /tmp/koyeb.tgz
-          sudo tar -C /usr/local/bin -xzf /tmp/koyeb.tgz koyeb
-          koyeb version
+          mkdir -p /tmp/koyeb-cli
+          curl -sSL "$URL" -o /tmp/koyeb-cli/koyeb.tgz
+          tar -xzf /tmp/koyeb-cli/koyeb.tgz -C /tmp/koyeb-cli
+
+          BIN="$(find /tmp/koyeb-cli -type f -name 'koyeb' | head -n1)"
+          if [ -z "$BIN" ]; then
+            echo "Binário 'koyeb' não encontrado após extração."
+            find /tmp/koyeb-cli -maxdepth 2 -type f -printf "%p\n" || true
+            exit 1
+          fi
+
+          sudo install -m 0755 "$BIN" /usr/local/bin/koyeb
+          koyeb --version
 
       - name: Deploy no Koyeb
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -z "${KOYEB_TOKEN:-}" ]; then
-            echo "ERRO: Secret KOYEB_TOKEN não está definido."
-            exit 1
-          fi
 
+          # Autentica no Koyeb
           koyeb login --token "$KOYEB_TOKEN"
 
-          # Cria o app se não existir
-          koyeb app create hello || echo "App 'hello' já existe"
+          # Garante que o app exista
+          if koyeb app get hello >/dev/null 2>&1; then
+            echo "App 'hello' já existe"
+          else
+            koyeb app create hello
+          fi
 
-          # Tenta criar o serviço; se já existir, faz update da imagem
-          koyeb service create app-hello \
-            --app hello \
-            --image "${{ env.IMAGE_NAME }}:${{ github.sha }}" \
-            --ports 8000:http \
-            --env PORT=8000 \
-            --routes / \
-          || koyeb service update app-hello \
-            --app hello \
-            --image "${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          # Cria ou atualiza o serviço
+          if koyeb service get --app hello app-hello >/dev/null 2>&1; then
+            echo "Atualizando serviço 'app-hello'..."
+            koyeb service update app-hello \
+              --app hello \
+              --image "${IMAGE_NAME}:${{ github.sha }}"
+          else
+            echo "Criando serviço 'app-hello'..."
+            koyeb service create app-hello \
+              --app hello \
+              --image "${IMAGE_NAME}:${{ github.sha }}" \
+              --ports 8000:http \
+              --env PORT=8000 \
+              --routes "/"
+          fi
 
-          # (Opcional) visualizar status
+          # Opcional: listar serviços após o rollout
           koyeb service list --app hello
