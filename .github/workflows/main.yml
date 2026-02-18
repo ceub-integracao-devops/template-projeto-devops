@@ -1,25 +1,23 @@
-name: CI/CD to Koyeb
+name: Deploy to Koyeb
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch:
 
 permissions:
   contents: read
   packages: write
 
-env:
-  IMAGE_REGISTRY: ghcr.io
-  IMAGE_OWNER: ${{ github.repository_owner }}
-  IMAGE_NAME: template-projeto-devops
-  KOYEB_APP: app-hello
-  KOYEB_SERVICE: web
-  KOYEB_PORT: "8080"
-
 jobs:
-  build-and-deploy:
+  deploy:
     runs-on: ubuntu-latest
+    env:
+      APP_NAME: app-hello
+      SERVICE_NAME: web
+      CONTAINER_PORT: "8000"
+      IMAGE_TAG_SHA: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+      IMAGE_TAG_LATEST: ghcr.io/${{ github.repository }}:latest
 
     steps:
       - name: Checkout
@@ -31,80 +29,83 @@ jobs:
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.IMAGE_REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push image (sha and latest)
-        uses: docker/build-push-action@v6
+      - name: Build and push image
+        uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: |
-            ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
-            ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:latest
-          cache-from: type=registry,ref=${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:buildcache
-          cache-to: type=registry,ref=${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+          tags: ${{ env.IMAGE_TAG_SHA }},${{ env.IMAGE_TAG_LATEST }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Install Koyeb CLI v5.9.0
+      - name: Install Koyeb CLI and deps
         run: |
           set -euo pipefail
-          curl -fsSL "https://github.com/koyeb/koyeb-cli/releases/download/v5.9.0/koyeb_5.9.0_Linux_x86_64.tar.gz" -o /tmp/koyeb.tgz
-          tar -xzf /tmp/koyeb.tgz -C /tmp
-          sudo mv /tmp/koyeb /usr/local/bin/koyeb
-          koyeb --help
+          sudo apt-get update
+          sudo apt-get install -y jq
+          curl -fsSL https://get.koyeb.com | bash
+          koyeb --version
 
-      - name: Configure Koyeb CLI non-interactive
+      - name: Configure Koyeb CLI (no TTY)
+        env:
+          KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
+          KOYEB_ORG: ${{ secrets.KOYEB_ORG }}
         run: |
           set -euo pipefail
-          mkdir -p "$HOME"
-          cat > "$HOME/.koyeb.yaml" <<'EOF'
-          api:
-            token: "${{ secrets.KOYEB_TOKEN }}"
-          organization: "${{ secrets.KOYEB_ORG }}"
-          apiUrl: "https://app.koyeb.com"
-          EOF
-          chmod 600 "$HOME/.koyeb.yaml"
-          echo "Config written to $HOME/.koyeb.yaml"
-
-      - name: Ensure app exists
-        id: ensure_app
-        run: |
-          set -euo pipefail
-          if koyeb apps get "${{ env.KOYEB_APP }}" >/dev/null 2>&1; then
-            echo "app_exists=true" >> "$GITHUB_OUTPUT"
-            echo "App exists."
-          else
-            echo "Creating app ${{ env.KOYEB_APP }}..."
-            koyeb apps create "${{ env.KOYEB_APP }}"
-            echo "app_exists=false" >> "$GITHUB_OUTPUT"
+          umask 177
+          printf "token: %s\n" "$KOYEB_TOKEN" > "$HOME/.koyeb.yaml"
+          if [ -n "${KOYEB_ORG:-}" ]; then
+            printf "organization: %s\n" "$KOYEB_ORG" >> "$HOME/.koyeb.yaml"
           fi
 
-      - name: Create or update service
+      - name: Ensure app exists
         run: |
           set -euo pipefail
-          APP="${{ env.KOYEB_APP }}"
-          SERVICE="${{ env.KOYEB_SERVICE }}"
-          IMG="${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}"
-          SERVICE_FQN="${APP}/${SERVICE}"
+          koyeb app get "${{ env.APP_NAME }}" >/dev/null 2>&1 || koyeb app create "${{ env.APP_NAME }}"
 
-          echo "Target image: ${IMG}"
+      - name: Deploy service (create or update)
+        env:
+          IMAGE: ${{ env.IMAGE_TAG_SHA }}
+        run: |
+          set -euo pipefail
+          # O comando 'deploy' cria o serviço se não existir e publica nova revisão se já existir.
+          koyeb deploy "$IMAGE" -a "${{ env.APP_NAME }}" -n "${{ env.SERVICE_NAME }}" -p "${{ env.CONTAINER_PORT }}:http"
 
-          if koyeb services get "${SERVICE_FQN}" >/dev/null 2>&1; then
-            echo "Service exists; attempting update..."
-            # TODO: Replace the update command with the exact syntax your CLI supports.
-            # Example variants (commented until we confirm the right one):
-            # koyeb services update "${SERVICE_FQN}" --container-image "${IMG}" --ports "${{ env.KOYEB_PORT }}:http"
-            # koyeb services update "${SERVICE_FQN}" --image "${IMG}" --ports "${{ env.KOYEB_PORT }}:http"
-            # koyeb services update "${SERVICE_FQN}" --container image="${IMG}" port="${{ env.KOYEB_PORT }}:http"
-            echo "Please paste 'koyeb services update --help' output so I can lock the correct flags."
-            exit 0
-          else
-            echo "Service not found; attempting create..."
-            # TODO: Replace the create command with the exact syntax your CLI supports.
-            # Example variants (commented until we confirm the right one):
-            # koyeb services create "${SERVICE}" --app "${APP}" --container-image "${IMG}" --ports "${{ env.KOYEB_PORT }}:http"
-            # koyeb services create "${SERVICE}" --app "${APP}" --image "${IMG}" --ports "${{ env.KOYEB_PORT }}:http"
-            # koyeb services create "${SERVICE}" --app "${APP}" --container image="${IMG}" port="${{ env.KOYEB_PORT }}:http"
-            echo "Please paste 'koyeb services create --help' output so I can lock the correct flags."
-            exit 0
+      - name: Wait for domain and test readiness (HTTP 200)
+        run: |
+          set -euo pipefail
+          APP="${{ env.APP_NAME }}"
+          SVC="${{ env.SERVICE_NAME }}"
+
+          # Espera o domínio aparecer
+          DOMAIN=""
+          for i in $(seq 1 60); do
+            DOMAIN=$(koyeb service get "$APP/$SVC" -o json | jq -r '.domains[0] // empty' || true)
+            if [ -n "$DOMAIN" ]; then
+              break
+            fi
+            sleep 5
+          done
+          if [ -z "$DOMAIN" ]; then
+            echo "Falha ao resolver domínio de $APP/$SVC"
+            koyeb service get "$APP/$SVC" || true
+            exit 1
+          fi
+
+          URL="https://$DOMAIN/"
+          echo "Testando $URL (aguardando 200)..."
+          CODE=""
+          for i in $(seq 1 60); do
+            CODE=$(curl -sS -o /dev/null -w "%{http_code}" "$URL" || true)
+            if [ "$CODE" = "200" ]; then
+              echo "OK: $URL -> 200"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Timeout aguardando HTTP 200 de $URL (último código: $CODE)"
+          exit 1
