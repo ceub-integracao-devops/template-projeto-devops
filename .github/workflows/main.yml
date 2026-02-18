@@ -3,23 +3,21 @@ name: Build and Deploy to Koyeb
 on:
   push:
     branches: [ "main" ]
-  workflow_dispatch:
 
-# Necessário para push no GHCR
 permissions:
   contents: read
   packages: write
 
 env:
-  # Ajuste os nomes abaixo para seu app/serviço na Koyeb
-  KOYEB_APP: app-hello
-  KOYEB_SERVICE: web
-  # Imagem publicada; o serviço na Koyeb deve apontar para :latest
-  IMAGE_LATEST: ghcr.io/${{ github.repository }}:latest
-  IMAGE_SHA: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  KOYEB_APP: app-hello            # altere se quiser
+  KOYEB_SERVICE: web              # altere se quiser
+  KOYEB_PORT: 3000                # porta do seu container (ex.: 3000, 8080)
+  KOYEB_CLI_VERSION: "5.9.0"
 
 jobs:
-  deploy:
+  build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
@@ -32,53 +30,86 @@ jobs:
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push image to GHCR (latest + sha)
-        run: |
-          set -euo pipefail
-          docker buildx build \
-            --push \
-            --platform linux/amd64 \
-            -t "${IMAGE_LATEST}" \
-            -t "${IMAGE_SHA}" \
-            .
+      - name: Build and push image to GHCR
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Install Koyeb CLI v5.9.0
+      - name: Install Koyeb CLI
         run: |
           set -euo pipefail
-          curl -fsSL -o /tmp/koyeb.tar.gz https://github.com/koyeb/koyeb-cli/releases/download/v5.9.0/koyeb-cli_5.9.0_linux_amd64.tar.gz
-          tar -C /usr/local/bin -xzf /tmp/koyeb.tar.gz koyeb
-          chmod +x /usr/local/bin/koyeb
-          # Checagem correta de versão (sem --version)
+          cd /tmp
+          echo "Baixando Koyeb CLI v${KOYEB_CLI_VERSION}..."
+          curl -fsSL -o koyeb.tgz "https://github.com/koyeb/koyeb-cli/releases/download/v${KOYEB_CLI_VERSION}/koyeb-cli_${KOYEB_CLI_VERSION}_linux_amd64.tar.gz"
+          tar -xzf koyeb.tgz
+          sudo mv koyeb /usr/local/bin/koyeb
           koyeb version
 
-      - name: (Opcional) Verificar token e listar serviços
+      - name: Create/Update service on Koyeb
         env:
           KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
+          KOYEB_ORG: ${{ secrets.KOYEB_ORG }}
         run: |
           set -euo pipefail
-          # Se o token estiver inválido, aqui já falha
-          koyeb services list --token "${KOYEB_TOKEN}" >/dev/null
 
-      - name: Redeploy do serviço existente na Koyeb
-        env:
-          KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
-          KOYEB_APP: ${{ env.KOYEB_APP }}
-          KOYEB_SERVICE: ${{ env.KOYEB_SERVICE }}
-          KOYEB_ORG: ${{ secrets.KOYEB_ORG_ID }} # opcional
-        run: |
-          set -euo pipefail
-          ORG_FLAG=""
+          APP="${KOYEB_APP}"
+          SERVICE="${KOYEB_SERVICE}"
+          PORT="${KOYEB_PORT}"
+          IMAGE_LATEST="${REGISTRY}/${IMAGE_NAME}:latest"
+
+          ORG_ARGS=()
           if [ -n "${KOYEB_ORG:-}" ]; then
-            ORG_FLAG="--organization ${KOYEB_ORG}"
+            ORG_ARGS+=(--organization "${KOYEB_ORG}")
           fi
 
-          echo "Descrevendo o serviço antes do redeploy (se não existir, este comando falha):"
-          koyeb services describe "${KOYEB_SERVICE}" --app "${KOYEB_APP}" ${ORG_FLAG} --token "${KOYEB_TOKEN}"
+          echo "Autenticando na Koyeb CLI..."
+          koyeb login --token "${KOYEB_TOKEN}"
 
-          echo "Disparando redeploy para o serviço ${KOYEB_SERVICE} no app ${KOYEB_APP}..."
-          # Importante: para o redeploy puxar a sua nova imagem, o serviço deve estar configurado na Koyeb para usar a tag :latest
-          koyeb services redeploy "${KOYEB_SERVICE}" --app "${KOYEB_APP}" ${ORG_FLAG} --token "${KOYEB_TOKEN}"
+          echo "Garantindo que o app '${APP}' exista..."
+          # Se já existir, o create falha; engolimos o erro para torná-lo idempotente.
+          koyeb apps create "${APP}" "${ORG_ARGS[@]}" >/dev/null 2>&1 || echo "App '${APP}' já existe ou foi criado agora."
+
+          echo "Verificando se o serviço '${APP}/${SERVICE}' existe..."
+          if koyeb services get "${APP}/${SERVICE}" "${ORG_ARGS[@]}" >/dev/null 2>&1; then
+            echo "Serviço encontrado. Atualizando imagem para ${IMAGE_LATEST}..."
+            koyeb services update "${APP}/${SERVICE}" \
+              --image "${IMAGE_LATEST}" \
+              "${ORG_ARGS[@]}"
+          else
+            echo "Serviço não encontrado. Criando serviço '${SERVICE}' no app '${APP}'..."
+            koyeb services create "${SERVICE}" \
+              --app "${APP}" \
+              --image "${IMAGE_LATEST}" \
+              --ports "${PORT}:http" \
+              "${ORG_ARGS[@]}"
+          fi
+
+          echo "Disparando redeploy para garantir que a última imagem esteja em execução..."
+          koyeb services redeploy "${APP}/${SERVICE}" "${ORG_ARGS[@]}"
+
+          echo "OK. Serviço ${APP}/${SERVICE} atualizado/criado com imagem ${IMAGE_LATEST}."
+
+      - name: Show service info
+        if: always()
+        env:
+          KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
+          KOYEB_ORG: ${{ secrets.KOYEB_ORG }}
+        run: |
+          set -euo pipefail
+          ORG_ARGS=()
+          if [ -n "${KOYEB_ORG:-}" ]; then
+            ORG_ARGS+=(--organization "${KOYEB_ORG}")
+          fi
+          koyeb login --token "${KOYEB_TOKEN}"
+          koyeb services describe "${KOYEB_APP}/${KOYEB_SERVICE}" "${ORG_ARGS[@]}" || true
