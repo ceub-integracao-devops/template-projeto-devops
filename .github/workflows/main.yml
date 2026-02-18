@@ -1,154 +1,118 @@
-name: CI/CD Koyeb
+name: CI-CD Koyeb
 
 on:
   push:
     branches: [ "main" ]
-    tags:
-      - "v*.*.*"
-
-permissions:
-  contents: read
-  packages: write
+  workflow_dispatch:
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
-  KOYEB_APP: your-app-name
-  KOYEB_SERVICE: web
-  EXPOSE_PORT: "8080"
-  # Se quiser validar após o deploy, informe a URL pública do serviço
-  HEALTHCHECK_URL: ""
+  KOYEB_APP: "app-hello"           # ajuste
+  KOYEB_SERVICE: "web"             # ajuste
+  EXPOSE_PORT: "8000"              # ajuste
+  HEALTHCHECK_URL: ""              # opcional; deixe vazio se não usar
+  KOYEB_VERSION: "5.9.0"
+  IMAGE_NAME: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Docker login (GHCR)
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-
-      - name: Install Koyeb CLI (latest)
         run: |
           set -euo pipefail
-          # Garante jq (runner geralmente já tem, mas deixo a contingência)
-          if ! command -v jq >/dev/null 2>&1; then
-            sudo apt-get update -y
-            sudo apt-get install -y jq
+          docker build -t "${IMAGE_NAME}" .
+          docker push "${IMAGE_NAME}"
+
+      - name: Install Koyeb CLI (fixed)
+        env:
+          KOYEB_VERSION: ${{ env.KOYEB_VERSION }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$HOME/.local/bin"
+          TMP="$(mktemp -d)"
+          URL="https://github.com/koyeb/koyeb-cli/releases/download/v${KOYEB_VERSION}/koyeb-cli_${KOYEB_VERSION}_linux_amd64.tar.gz"
+
+          echo "Baixando: $URL"
+          curl -fsSL -o "$TMP/koyeb.tgz" "$URL"
+          tar -xzf "$TMP/koyeb.tgz" -C "$TMP"
+
+          BIN="$TMP/koyeb-cli_${KOYEB_VERSION}_linux_amd64/koyeb"
+          if [ ! -f "$BIN" ]; then
+            echo "Binário 'koyeb' não encontrado em $BIN"
+            echo "Conteúdo extraído:"
+            find "$TMP" -maxdepth 3 -type f -print
+            exit 1
           fi
-          api='https://api.github.com/repos/koyeb/koyeb-cli/releases/latest'
-          url="$(curl -fsSL "$api" | jq -r '
-            .assets[]
-            | select((.name|test("linux";"i")) and (.name|test("(amd64|x86_64|x64)";"i")) and (.name|endswith(".tar.gz")))
-            | .browser_download_url
-          ' | head -n1)"
-          if [ -z "$url" ]; then
-            echo "Asset Linux amd64 da Koyeb CLI não encontrado"; exit 1
-          fi
-          echo "Baixando: $url"
-          curl -fsSL "$url" -o /tmp/koyeb.tgz
-          tar -xzf /tmp/koyeb.tgz -C /tmp
-          binpath="$(find /tmp -maxdepth 3 -type f -name koyeb | head -n1)"
-          if [ -z "${binpath:-}" ]; then
-            echo "Binário 'koyeb' não encontrado no tar"; exit 1
-          fi
-          sudo mv "$binpath" /usr/local/bin/koyeb
-          sudo chmod +x /usr/local/bin/koyeb
+
+          install -m 0755 "$BIN" "$HOME/.local/bin/koyeb"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           koyeb version
 
-      - name: Authenticate to Koyeb
+      - name: Koyeb login (non-interactive)
         env:
           KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
         run: |
           set -euo pipefail
-          if koyeb help 2>&1 | grep -qE '\slogin\s'; then
-            koyeb login --token "$KOYEB_TOKEN" --no-browser
-          else
-            export KOYEB_API_TOKEN="$KOYEB_TOKEN"
-            export KOYEB_TOKEN="$KOYEB_TOKEN"
-          fi
-          # Valida autenticação
-          koyeb apps list >/dev/null
+          # A CLI usa KOYEB_API_TOKEN; exporte e valide a conta
+          export KOYEB_API_TOKEN="${KOYEB_TOKEN}"
+          koyeb account get >/dev/null
 
       - name: Deploy to Koyeb
         env:
-          IMAGE_URI: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          KOYEB_APP: ${{ env.KOYEB_APP }}
+          KOYEB_SERVICE: ${{ env.KOYEB_SERVICE }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          EXPOSE_PORT: ${{ env.EXPOSE_PORT }}
         run: |
           set -euo pipefail
-          app="$KOYEB_APP"
-          svc="$KOYEB_SERVICE"
-          port="$EXPOSE_PORT"
-          img="$IMAGE_URI"
 
-          echo "Aplicativo: $app"
-          echo "Serviço: $svc"
-          echo "Imagem: $img"
-          echo "Porta: $port"
-
-          # Garante que o app exista
-          if ! koyeb apps list 2>/dev/null | awk '{print $1}' | grep -qx "$app"; then
-            echo "Criando app $app..."
-            koyeb apps create "$app"
-          else
-            echo "App $app já existe."
+          # Garante que o app existe
+          if ! koyeb app get "$KOYEB_APP" >/dev/null 2>&1; then
+            koyeb app create "$KOYEB_APP"
           fi
 
-          service_exists() {
-            koyeb services list --app "$app" 2>/dev/null | awk '{print $1}' | grep -qx "$svc"
-          }
-
-          if service_exists; then
-            echo "Serviço $svc já existe. Tentando redeploy/update..."
-            if koyeb services redeploy --help >/dev/null 2>&1; then
-              koyeb services redeploy "$svc" --app "$app" --image "$img"
-            elif koyeb services update --help >/dev/null 2>&1; then
-              koyeb services update "$svc" --app "$app" --image "$img"
-            else
-              echo "Nenhum comando de update/redeploy disponível na CLI"; exit 1
-            fi
+          # Cria/atualiza o serviço com a nova imagem
+          if ! koyeb service get "$KOYEB_APP/$KOYEB_SERVICE" >/dev/null 2>&1; then
+            # Ajuste os flags abaixo conforme sua config (ports, envs, resources, etc.)
+            koyeb service create "$KOYEB_APP/$KOYEB_SERVICE" \
+              --container image="${IMAGE_NAME}" ports="${EXPOSE_PORT}:http"
           else
-            echo "Criando serviço $svc..."
-            if koyeb services create --help 2>&1 | grep -q -- '--ports'; then
-              koyeb services create "$svc" --app "$app" --image "$img" --ports "${port}:http"
-            else
-              # Fallback sem --ports (caso a flag não exista nesta versão)
-              koyeb services create "$svc" --app "$app" --image "$img"
-            fi
+            koyeb service update "$KOYEB_APP/$KOYEB_SERVICE" \
+              --container image="${IMAGE_NAME}" ports="${EXPOSE_PORT}:http"
           fi
 
-          echo "Aguardando rollout (best-effort)..."
-          sleep 5
-          if koyeb deployments list --app "$app" --service "$svc" --limit 1 2>/dev/null | grep -Eq 'HEALTHY|READY'; then
-            echo "Rollout HEALTHY/READY detectado."
-          else
-            echo "Não foi possível confirmar HEALTHY/READY pela CLI; seguindo."
-          fi
+          # Opcional: mostrar último deployment
+          koyeb deployment list "$KOYEB_APP/$KOYEB_SERVICE" --limit 1 || true
 
       - name: Healthcheck (optional)
         if: ${{ env.HEALTHCHECK_URL != '' }}
+        env:
+          HEALTHCHECK_URL: ${{ env.HEALTHCHECK_URL }}
         run: |
           set -euo pipefail
           for i in $(seq 1 30); do
-            code="$(curl -fsS -o /dev/null -w '%{http_code}' "$HEALTHCHECK_URL" || true)"
-            if [ "$code" = "200" ]; then
-              echo "Healthcheck OK (200)"; exit 0
+            code="$(curl -sk -o /dev/null -w '%{http_code}' "$HEALTHCHECK_URL" || true)"
+            if [ "$code" = "200" ] || [ "$code" = "204" ]; then
+              echo "Healthcheck OK ($code)"
+              exit 0
             fi
-            echo "Tentativa $i: status $code; aguardando..."
+            echo "Aguardando ($i/30)... HTTP $code"
             sleep 5
           done
-          echo "Healthcheck não retornou 200 no tempo limite"; exit 1
+          echo "Healthcheck falhou"
+          exit 1
