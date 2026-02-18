@@ -12,121 +12,132 @@ permissions:
 
 jobs:
   build-and-deploy:
-    name: Build, Push (GHCR) e Deploy (Koyeb)
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Normalizar IMAGE_NAME (owner em minúsculas)
+      - name: Definir variáveis (owner minúsculo, imagem e tags)
+        id: vars
+        shell: bash
         run: |
-          OWNER_LC="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
-          echo "OWNER_LC=$OWNER_LC" >> $GITHUB_ENV
-          echo "IMAGE_NAME=ghcr.io/$OWNER_LC/app-hello" >> $GITHUB_ENV
+          set -euo pipefail
+          OWNER="${GITHUB_REPOSITORY_OWNER}"
+          OWNER_LC="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          echo "OWNER_LC=$OWNER_LC" >> "$GITHUB_ENV"
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+          IMAGE="ghcr.io/${OWNER_LC}/app-hello"
+          TAG_SHA="${GITHUB_SHA::7}"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo "TAG_SHA=$TAG_SHA" >> "$GITHUB_ENV"
 
       - name: Login no GHCR
         if: github.event_name == 'push'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
 
-      - name: Build (e Push se push)
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: ${{ github.event_name == 'push' }}
-          tags: |
-            ${{ env.IMAGE_NAME }}:latest
-            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+      - name: Build da imagem (local)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build \
+            -t "${IMAGE}:latest" \
+            -t "${IMAGE}:${TAG_SHA}" \
+            .
 
-      - name: Instalar Koyeb CLI (última release)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      - name: Push da imagem (somente push em main)
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker push "${IMAGE}:latest"
+          docker push "${IMAGE}:${TAG_SHA}"
+
+      - name: Instalar Koyeb CLI (latest, OS/arch auto)
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
-          OS="linux"
-          ARCH_RAW="$(uname -m)"
-          case "$ARCH_RAW" in
-            x86_64|amd64) ARCH_PATS="x86_64|amd64" ;;
-            aarch64|arm64) ARCH_PATS="arm64|aarch64" ;;
-            *) echo "Arquitetura não suportada: $ARCH_RAW"; exit 1 ;;
+          sudo apt-get update -y
+          sudo apt-get install -y curl jq tar
+          OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            x86_64|amd64) A1="amd64"; A2="x86_64" ;;
+            aarch64|arm64) A1="arm64"; A2="arm64" ;;
+            *) echo "Arquitetura não suportada: $ARCH"; exit 1 ;;
           esac
-
           API_URL="https://api.github.com/repos/koyeb/koyeb-cli/releases/latest"
-          JSON="$(curl -sSL -H "Accept: application/vnd.github+json" \
-                          -H "User-Agent: gha-koyeb-installer" \
-                          -H "Authorization: Bearer ${GH_TOKEN}" \
-                          "$API_URL")"
-
-          URL="$(echo "$JSON" | jq -r \
-            --arg os "$OS" \
-            --arg pats "$ARCH_PATS" \
-            '[.assets[].browser_download_url
-              | select(test("(?i)"+$os) and test("(?i)("+$pats+")") and test("\.tar\.gz$"))
-            ][0] // empty')"
-
-          if [ -z "$URL" ]; then
-            echo "Não foi possível encontrar asset do Koyeb CLI para $OS ($ARCH_RAW)."
-            echo "Assets disponíveis:"
-            echo "$JSON" | jq -r '.assets[].browser_download_url'
+          HDR_AUTH=()
+          if [ -n "${GH_TOKEN:-}" ]; then
+            HDR_AUTH=(-H "Authorization: Bearer ${GH_TOKEN}")
+          fi
+          JSON="$(curl -fsSL -H "Accept: application/vnd.github+json" "${HDR_AUTH[@]}" "$API_URL")"
+          DL_URL="$(echo "$JSON" \
+            | jq -r --arg os "$OS" --arg a1 "$A1" --arg a2 "$A2" '
+                .assets[]
+                | .name as $n
+                | select(
+                    ($n|ascii_downcase|contains($os))
+                    and (
+                      ($n|ascii_downcase|contains($a1))
+                      or ($n|ascii_downcase|contains($a2))
+                    )
+                    and ($n|endswith(".tar.gz"))
+                  )
+                | .browser_download_url
+              ' | head -n1)"
+          if [ -z "$DL_URL" ] || [ "$DL_URL" = "null" ]; then
+            echo "Não encontrei asset para $OS/$ARCH"
+            echo "$JSON" | jq -r '.assets[].name'
             exit 1
           fi
+          curl -fsSL "$DL_URL" -o /tmp/koyeb.tgz
+          tar -xzf /tmp/koyeb.tgz -C /tmp
+          sudo install -m 0755 "$(find /tmp -type f -name 'koyeb' | head -n1)" /usr/local/bin/koyeb
+          koyeb version
 
-          echo "Baixando Koyeb CLI: $URL"
-          mkdir -p /tmp/koyeb-cli
-          curl -sSL "$URL" -o /tmp/koyeb-cli/koyeb.tgz
-          tar -xzf /tmp/koyeb-cli/koyeb.tgz -C /tmp/koyeb-cli
-
-          BIN="$(find /tmp/koyeb-cli -type f -name 'koyeb' | head -n1)"
-          if [ -z "$BIN" ]; then
-            echo "Binário 'koyeb' não encontrado após extração."
-            find /tmp/koyeb-cli -maxdepth 2 -type f -printf "%p\n" || true
-            exit 1
-          fi
-
-          sudo install -m 0755 "$BIN" /usr/local/bin/koyeb
-          koyeb --version
-
-      - name: Deploy no Koyeb
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      - name: Deploy no Koyeb (somente push em main)
+        if: github.event_name == 'push'
         env:
           KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
+          IMAGE: ${{ env.IMAGE }}
+          TAG_SHA: ${{ env.TAG_SHA }}
+        shell: bash
         run: |
           set -euo pipefail
 
-          # Autentica no Koyeb
-          koyeb login --token "$KOYEB_TOKEN"
-
-          # Garante que o app exista
-          if koyeb app get hello >/dev/null 2>&1; then
-            echo "App 'hello' já existe"
-          else
-            koyeb app create hello
+          if [ -z "${KOYEB_TOKEN:-}" ]; then
+            echo "KOYEB_TOKEN não definido em Secrets."
+            exit 1
           fi
 
-          # Cria ou atualiza o serviço
-          if koyeb service get --app hello app-hello >/dev/null 2>&1; then
-            echo "Atualizando serviço 'app-hello'..."
-            koyeb service update app-hello \
-              --app hello \
-              --image "${IMAGE_NAME}:${{ github.sha }}"
-          else
-            echo "Criando serviço 'app-hello'..."
-            koyeb service create app-hello \
-              --app hello \
-              --image "${IMAGE_NAME}:${{ github.sha }}" \
-              --ports 8000:http \
-              --env PORT=8000 \
-              --routes "/"
+          # Login na Koyeb CLI
+          koyeb auth login --token "$KOYEB_TOKEN"
+
+          APP_NAME="app-hello"
+          SVC_NAME="web"
+          IMAGE_REF="${IMAGE}:latest"
+
+          # Se o app não existir, cria
+          if ! koyeb app get "$APP_NAME" >/dev/null 2>&1; then
+            koyeb app create "$APP_NAME"
           fi
 
-          # Opcional: listar serviços após o rollout
-          koyeb service list --app hello
+          # Se o serviço não existir, cria. Caso exista, atualiza a imagem
+          if ! koyeb service get "$APP_NAME/$SVC_NAME" >/dev/null 2>&1; then
+            koyeb service create "$APP_NAME/$SVC_NAME" \
+              --docker "$IMAGE_REF" \
+              --ports 8080:http
+          else
+            koyeb service update "$APP_NAME/$SVC_NAME" \
+              --docker "$IMAGE_REF"
+          fi
+
+          # Opcional: aguardar rollout (descomente para bloquear até ficar saudável)
+          # koyeb service rollout status "$APP_NAME/$SVC_NAME" --watch --timeout 300
