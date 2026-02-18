@@ -1,112 +1,159 @@
-name: Build and Deploy to Koyeb
+name: Deploy to Koyeb
 
 on:
   push:
     branches: [ "main" ]
-  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
-  # Ajuste estes valores conforme o seu ambiente
-  KOYEB_APP: app-hello
-  KOYEB_SERVICE: web
-  KOYEB_PORT: 8000
+  # Ajuste estes valores conforme seu contexto
+  KOYEB_APP: "app-hello"
+  KOYEB_SERVICE: "web"
+  KOYEB_PORT: "8000" # Porta em que seu container escuta. Ajuste se necessário.
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Set repo variables
+        id: vars
+        run: |
+          set -euo pipefail
+          REPO_LC="$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          echo "repo_lc=${REPO_LC}" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
 
-      - name: Build and push image (GHCR)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Build and Push Image (sha and latest)
+        run: |
+          set -euo pipefail
+          IMAGE_BASE="ghcr.io/${{ steps.vars.outputs.repo_lc }}"
+          SHA_TAG="${{ steps.vars.outputs.sha_tag }}"
+          docker build -t "${IMAGE_BASE}:${SHA_TAG}" -t "${IMAGE_BASE}:latest" .
+          docker push "${IMAGE_BASE}:${SHA_TAG}"
+          docker push "${IMAGE_BASE}:latest"
+          echo "image_sha=${IMAGE_BASE}:${SHA_TAG}" >> $GITHUB_ENV
+          echo "image_latest=${IMAGE_BASE}:latest" >> $GITHUB_ENV
 
       - name: Install Koyeb CLI v5.9.0
         run: |
           set -euo pipefail
-          KOYEB_VERSION=5.9.0
-          curl -fsSL -o /tmp/koyeb.tar.gz "https://github.com/koyeb/koyeb-cli/releases/download/v${KOYEB_VERSION}/koyeb-cli_${KOYEB_VERSION}_linux_amd64.tar.gz"
+          URL="https://github.com/koyeb/koyeb-cli/releases/download/v5.9.0/koyeb-cli_5.9.0_linux_amd64.tar.gz"
+          curl -fsSL "$URL" -o /tmp/koyeb.tar.gz
           tar -xzf /tmp/koyeb.tar.gz -C /tmp
           sudo mv /tmp/koyeb /usr/local/bin/koyeb
-          koyeb version
           koyeb --help | head -n 20
 
       - name: Configure Koyeb CLI (non-interactive)
-        env:
-          KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
-          KOYEB_ORG: ${{ secrets.KOYEB_ORG }}
         run: |
           set -euo pipefail
           mkdir -p "$HOME"
-          # Cria ~/.koyeb.yaml com o token (e org se definido)
-          {
-            echo "token: "${KOYEB_TOKEN}""
-            if [ -n "${KOYEB_ORG:-}" ]; then
-              echo "organization: "${KOYEB_ORG}""
-            fi
-            echo "url: "https://app.koyeb.com""
-            echo "output: "human""
-          } > "$HOME/.koyeb.yaml"
-          # Sanity check com um comando simples
-          koyeb apps list -o table || true
+          CFG="$HOME/.koyeb.yaml"
+          echo "token: ${${{ secrets.KOYEB_TOKEN }}:-}" >/tmp/.koyeb.yaml || true
+          # Proteção: falha explícita se KOYEB_TOKEN não estiver definido
+          if [ -z "${{ secrets.KOYEB_TOKEN }}" ]; then
+            echo "KOYEB_TOKEN não definido nos secrets do repositório"; exit 1
+          fi
+          echo "token: ${{ secrets.KOYEB_TOKEN }}" > "$CFG"
+          if [ -n "${{ secrets.KOYEB_ORG }}" ]; then
+            echo "organization: ${{ secrets.KOYEB_ORG }}" >> "$CFG"
+          fi
+          chmod 600 "$CFG"
 
-      - name: Create/Update Koyeb app and service
-        env:
-          IMAGE_SHA: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
-          KOYEB_APP: ${{ env.KOYEB_APP }}
-          KOYEB_SERVICE: ${{ env.KOYEB_SERVICE }}
-          KOYEB_PORT: ${{ env.KOYEB_PORT }}
+      - name: Ensure app exists
+        run: |
+          set -euo pipefail
+          if ! koyeb apps get "${KOYEB_APP}" >/dev/null 2>&1; then
+            echo "Criando app '${KOYEB_APP}'..."
+            koyeb apps create "${KOYEB_APP}"
+          else
+            echo "App '${KOYEB_APP}' já existe."
+          fi
+
+      - name: Create or Update service (auto-detect CLI syntax)
         run: |
           set -euo pipefail
 
-          echo "Garantindo que o app '${KOYEB_APP}' exista..."
-          if koyeb apps describe "${KOYEB_APP}" >/dev/null 2>&1; then
-            echo "App já existe."
+          IMAGE="${image_sha:-$image_latest}"
+          echo "Usando imagem: ${IMAGE}"
+
+          service_exists() {
+            koyeb services get "${KOYEB_APP}/${KOYEB_SERVICE}" >/dev/null 2>&1
+          }
+
+          try_variants() {
+            local mode="$1" # "create" ou "update"
+            local ok=0
+
+            if [ "$mode" = "create" ]; then
+              CMDS=$(cat <<'EOF'
+koyeb services create container --app "$KOYEB_APP" --name "$KOYEB_SERVICE" --image "$IMAGE" --ports "$KOYEB_PORT:http"
+koyeb services deploy container --app "$KOYEB_APP" --name "$KOYEB_SERVICE" --image "$IMAGE" --ports "$KOYEB_PORT:http"
+koyeb services create --app "$KOYEB_APP" --name "$KOYEB_SERVICE" --container-image "$IMAGE" --ports "$KOYEB_PORT:http"
+EOF
+)
+            else
+              CMDS=$(cat <<'EOF'
+koyeb services update "$KOYEB_APP/$KOYEB_SERVICE" --container-image "$IMAGE"
+koyeb services redeploy "$KOYEB_APP/$KOYEB_SERVICE" --image "$IMAGE"
+koyeb services deploy container --app "$KOYEB_APP" --name "$KOYEB_SERVICE" --image "$IMAGE" --ports "$KOYEB_PORT:http"
+EOF
+)
+            fi
+
+            while IFS= read -r cmd; do
+              [ -z "$cmd" ] && continue
+              echo "Tentando: $cmd"
+              if bash -lc "$cmd"; then
+                echo "Sucesso com: $cmd"
+                ok=1
+                break
+              else
+                echo "Falhou: $cmd"
+              fi
+            done <<< "$CMDS"
+
+            if [ "$ok" -ne 1 ]; then
+              echo "Nenhuma variante de '$mode' funcionou."
+              return 1
+            fi
+            return 0
+          }
+
+          if service_exists; then
+            echo "Serviço '${KOYEB_APP}/${KOYEB_SERVICE}' existe. Tentando atualizar/redeploy..."
+            if ! try_variants "update"; then
+              echo "Falha ao atualizar. Mostrando helps para diagnóstico:"
+              echo "---- koyeb services --help ----"; koyeb services --help || true
+              echo "---- koyeb services create --help ----"; koyeb services create --help || true
+              echo "---- koyeb services update --help ----"; koyeb services update --help || true
+              echo "---- koyeb services deploy --help ----"; koyeb services deploy --help || true
+              echo "---- koyeb services redeploy --help ----"; koyeb services redeploy --help || true
+              exit 1
+            fi
           else
-            echo "Criando app '${KOYEB_APP}'..."
-            koyeb apps create "${KOYEB_APP}"
+            echo "Serviço '${KOYEB_APP}/${KOYEB_SERVICE}' não existe. Tentando criar..."
+            if ! try_variants "create"; then
+              echo "Falha ao criar serviço. Helps para diagnóstico:"
+              echo "---- koyeb services --help ----"; koyeb services --help || true
+              echo "---- koyeb services create --help ----"; koyeb services create --help || true
+              echo "---- koyeb services deploy --help ----"; koyeb services deploy --help || true
+              exit 1
+            fi
           fi
 
-          echo "Garantindo que o serviço '${KOYEB_APP}/${KOYEB_SERVICE}' exista..."
-          if koyeb services describe "${KOYEB_APP}/${KOYEB_SERVICE}" >/dev/null 2>&1; then
-            echo "Serviço existe. Criando novo deployment com a imagem ${IMAGE_SHA}..."
-            koyeb deployments create \
-              --service "${KOYEB_APP}/${KOYEB_SERVICE}" \
-              --image "${IMAGE_SHA}"
-          else
-            echo "Criando serviço '${KOYEB_SERVICE}' no app '${KOYEB_APP}' com a imagem ${IMAGE_SHA}..."
-            koyeb services create "${KOYEB_SERVICE}" \
-              --app "${KOYEB_APP}" \
-              --image "${IMAGE_SHA}" \
-              --ports "${KOYEB_PORT}:http"
-              # Adicione envs se necessário repetindo --env KEY=VALUE
-              # Ex: --env NODE_ENV=production --env API_URL=https://...
-          fi
-
-          echo "Descrição do serviço após a operação:"
-          koyeb services describe "${KOYEB_APP}/${KOYEB_SERVICE}" -o yaml || true
+      - name: Describe service
+        run: |
+          set -euo pipefail
+          koyeb services get "${KOYEB_APP}/${KOYEB_SERVICE}" || true
+          koyeb services list --app "${KOYEB_APP}" || true
