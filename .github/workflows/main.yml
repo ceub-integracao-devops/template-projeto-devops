@@ -12,7 +12,7 @@ permissions:
 
 env:
   # Ajuste os nomes abaixo para seu app/serviço na Koyeb
-  KOYEB_APP: my-app
+  KOYEB_APP: app-hello
   KOYEB_SERVICE: web
   # Imagem publicada; o serviço na Koyeb deve apontar para :latest
   IMAGE_LATEST: ghcr.io/${{ github.repository }}:latest
