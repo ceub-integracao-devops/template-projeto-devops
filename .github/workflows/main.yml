@@ -29,7 +29,7 @@ jobs:
         env:
           OWNER: ${{ github.repository_owner }}
 
-      # Faz login no GHCR apenas em push (em PRs de forks o token não tem permissão de write)
+      # Login no GHCR apenas no push (evita erro em PRs de forks)
       - name: Login no GHCR
         if: github.event_name == 'push'
         uses: docker/login-action@v3
@@ -48,9 +48,33 @@ jobs:
             ${{ env.IMAGE_NAME }}:latest
             ${{ env.IMAGE_NAME }}:${{ github.sha }}
 
-      - name: Configurar Koyeb CLI
+      # Instala a CLI do Koyeb (substitui a action inexistente)
+      - name: Instalar Koyeb CLI
         if: github.event_name == 'push'
-        uses: koyeb/action-setup@v1
+        env:
+          KOYEB_VERSION: latest
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y curl jq tar
+
+          VER="${KOYEB_VERSION:-latest}"
+          if [ "$VER" = "latest" ]; then
+            VER="$(curl -fsSL https://api.github.com/repos/koyeb/koyeb-cli/releases/latest | jq -r .tag_name | sed 's/^v//')"
+          fi
+
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            x86_64) ARCH="x86_64" ;;
+            aarch64|arm64) ARCH="arm64" ;;
+            *) echo "Arquitetura não suportada: $ARCH" >&2; exit 1 ;;
+          esac
+
+          URL="https://github.com/koyeb/koyeb-cli/releases/download/v${VER}/koyeb_${VER}_Linux_${ARCH}.tar.gz"
+          echo "Baixando Koyeb CLI: $URL"
+          curl -fsSL "$URL" -o /tmp/koyeb.tgz
+          sudo tar -C /usr/local/bin -xzf /tmp/koyeb.tgz koyeb
+          koyeb version
 
       - name: Deploy no Koyeb
         if: github.event_name == 'push'
@@ -63,13 +87,12 @@ jobs:
             exit 1
           fi
 
-          # Autentica no Koyeb
           koyeb login --token "$KOYEB_TOKEN"
 
-          # Cria o app (idempotente; se existir, apenas informa)
+          # Cria o app se não existir
           koyeb app create hello || echo "App 'hello' já existe"
 
-          # Cria o serviço; se já existir, faz update da imagem
+          # Tenta criar o serviço; se já existir, faz update da imagem
           koyeb service create app-hello \
             --app hello \
             --image "${{ env.IMAGE_NAME }}:${{ github.sha }}" \
@@ -80,5 +103,5 @@ jobs:
             --app hello \
             --image "${{ env.IMAGE_NAME }}:${{ github.sha }}"
 
-          # Status (opcional)
+          # (Opcional) visualizar status
           koyeb service list --app hello
