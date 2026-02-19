@@ -1,111 +1,42 @@
-name: Deploy to Koyeb
+name: CI/CD Pipeline - Render
 
 on:
   push:
-    branches: ["main"]
-  workflow_dispatch:
+    branches: [ "main" ]
 
-permissions:
-  contents: read
-  packages: write
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  deploy:
+  build-and-push:
     runs-on: ubuntu-latest
-    env:
-      APP_NAME: app-hello
-      SERVICE_NAME: web
-      CONTAINER_PORT: "8000"
-      IMAGE_TAG_SHA: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
-      IMAGE_TAG_LATEST: ghcr.io/${{ github.repository }}:latest
+    permissions:
+      contents: read
+      packages: write
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
+      - name: Log in to the Container registry
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push image
+      - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: ${{ env.IMAGE_TAG_SHA }},${{ env.IMAGE_TAG_LATEST }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
 
-      - name: Install Koyeb CLI and deps
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to Render
         run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y jq
-          curl -fsSL https://get.koyeb.com | bash
-          koyeb --version
-
-      - name: Configure Koyeb CLI (no TTY)
-        env:
-          KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
-          KOYEB_ORG: ${{ secrets.KOYEB_ORG }}
-        run: |
-          set -euo pipefail
-          umask 177
-          printf "token: %s\n" "$KOYEB_TOKEN" > "$HOME/.koyeb.yaml"
-          if [ -n "${KOYEB_ORG:-}" ]; then
-            printf "organization: %s\n" "$KOYEB_ORG" >> "$HOME/.koyeb.yaml"
-          fi
-
-      - name: Ensure app exists
-        run: |
-          set -euo pipefail
-          koyeb app get "${{ env.APP_NAME }}" >/dev/null 2>&1 || koyeb app create "${{ env.APP_NAME }}"
-
-      - name: Deploy service (create or update)
-        env:
-          IMAGE: ${{ env.IMAGE_TAG_SHA }}
-        run: |
-          set -euo pipefail
-          # O comando 'deploy' cria o serviço se não existir e publica nova revisão se já existir.
-          koyeb deploy "$IMAGE" -a "${{ env.APP_NAME }}" -n "${{ env.SERVICE_NAME }}" -p "${{ env.CONTAINER_PORT }}:http"
-
-      - name: Wait for domain and test readiness (HTTP 200)
-        run: |
-          set -euo pipefail
-          APP="${{ env.APP_NAME }}"
-          SVC="${{ env.SERVICE_NAME }}"
-
-          # Espera o domínio aparecer
-          DOMAIN=""
-          for i in $(seq 1 60); do
-            DOMAIN=$(koyeb service get "$APP/$SVC" -o json | jq -r '.domains[0] // empty' || true)
-            if [ -n "$DOMAIN" ]; then
-              break
-            fi
-            sleep 5
-          done
-          if [ -z "$DOMAIN" ]; then
-            echo "Falha ao resolver domínio de $APP/$SVC"
-            koyeb service get "$APP/$SVC" || true
-            exit 1
-          fi
-
-          URL="https://$DOMAIN/"
-          echo "Testando $URL (aguardando 200)..."
-          CODE=""
-          for i in $(seq 1 60); do
-            CODE=$(curl -sS -o /dev/null -w "%{http_code}" "$URL" || true)
-            if [ "$CODE" = "200" ]; then
-              echo "OK: $URL -> 200"
-              exit 0
-            fi
-            sleep 5
-          done
-          echo "Timeout aguardando HTTP 200 de $URL (último código: $CODE)"
-          exit 1
+          curl -f ${{ secrets.RENDER_DEPLOY_HOOK }}
