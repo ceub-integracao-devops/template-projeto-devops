@@ -55,7 +55,7 @@ def hello(nome: str = "visitante"):
         </style>
     </head>
     <body>
-        <h1>Olá, {nome}!</h1>
+        <h1>Oi, {nome}!</h1>
         <p>Seu número da sorte (0-10) é: <strong>{numero_da_sorte}</strong></p>
         <a class="voltar" href="/">Voltar</a>
     </body>
