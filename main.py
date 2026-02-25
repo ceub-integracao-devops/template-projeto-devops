@@ -41,7 +41,7 @@ def hello(nome: str = "visitante"):
     # Vulnerável a XSS por concatenação direta sem sanitização/escaping (requisito do laboratório)
     # Observação: O texto diz que o intervalo deveria ser 0-10, mas abaixo usamos randint(11, 20)
     # propositalmente para falhar no teste unitário futuro.
-    numero_da_sorte = random.randint(0, 10)
+    numero_da_sorte = random.randint(11, 20)
 
     html = f"""
     <!DOCTYPE html>
