@@ -3,29 +3,47 @@ name: CI/CD Pipeline - Render
 on:
   push:
     branches: [ "main" ]
+  pull_request: # <-- FAZ O TESTE RODAR NO PR PARA DESTRAVAR O MERGE
+    branches: [ "main" ]
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build-and-push:
+  # JOB 1: VALIDAR (O porteiro)
+  unit-tests:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest httpx
+      - name: Run Tests
+        run: python -m pytest
+
+  # JOB 2: CONSTRUIR (A fábrica)
+  build-and-push:
+    needs: unit-tests # SÓ CONSTRÓI SE O TESTE PASSAR
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' # SÓ GERA IMAGEM NO PUSH DA MAIN
     permissions:
       contents: read
       packages: write
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Log in to the Container registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
@@ -33,10 +51,11 @@ jobs:
           push: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
 
+  # JOB 3: ENTREGAR (O carteiro)
   deploy:
     needs: build-and-push
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' # SÓ DEPLOYA NO PUSH DA MAIN
     steps:
       - name: Deploy to Render
-        run: |
-          curl -f ${{ secrets.RENDER_DEPLOY_HOOK }}
+        run: curl -f ${{ secrets.RENDER_DEPLOY_HOOK }}
