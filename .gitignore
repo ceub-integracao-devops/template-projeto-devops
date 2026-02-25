@@ -1,0 +1,13 @@
+# Python bytecode (arquivos de cache)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Pastas de ferramentas de teste
+.pytest_cache/
+
+# Ambientes virtuais
+venv/
+env/
+.venv/
