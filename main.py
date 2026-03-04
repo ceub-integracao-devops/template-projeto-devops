@@ -14,7 +14,7 @@ def index():
     <html lang="pt-BR">
     <head>
         <meta charset="utf-8" />
-        <title>App Hello!!</title>
+        <title>App Hello!</title>
         <style>
             body { font-family: Arial, sans-serif; margin: 40px; }
             form { margin-top: 20px; }
