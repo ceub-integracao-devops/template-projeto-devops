@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 import random
+import html
 
 app = FastAPI(title="App Hello - v1.0.0")
 
@@ -43,6 +44,7 @@ def hello(nome: str = "visitante"):
     # Observação: O texto diz que o intervalo deveria ser 0-10, mas abaixo usamos randint(11, 20)
     # propositalmente para falhar no teste unitário futuro.
     numero_da_sorte = random.randint(1, 10)
+    safe_nome = html.escape(nome, quote=True)
 
     html = f"""
     <!DOCTYPE html>
@@ -57,7 +59,7 @@ def hello(nome: str = "visitante"):
         </style>
     </head>
     <body>
-        <h1>Olá, ({nome})!!</h1>
+        <h1>Olá, ({safe_nome})!!</h1>
         <p>Seu número da sorte (0-10) é: <strong>{numero_da_sorte}</strong></p>
         <a class="voltar" href="/">Voltar</a>
     </body>
