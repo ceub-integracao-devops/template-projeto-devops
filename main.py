@@ -46,7 +46,7 @@ def hello(nome: str = "visitante"):
     numero_da_sorte = random.randint(1, 10)
     safe_nome = html.escape(nome, quote=True)
 
-    html = f"""
+    html_response = f"""
     <!DOCTYPE html>
     <html lang="pt-BR">
     <head>
