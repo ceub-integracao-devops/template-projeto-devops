@@ -10,7 +10,7 @@ app = FastAPI(title="App Hello - v1.0.0")
 @app.get("/", response_class=HTMLResponse)
 def index():
     # Formulário simples (GET) que envia para /hello
-    html = """
+    html_response = """
     <!DOCTYPE html>
     <html lang="pt-BR">
     <head>
@@ -35,7 +35,7 @@ def index():
     </body>
     </html>
     """
-    return HTMLResponse(content=html, status_code=200)
+    return HTMLResponse(content=html_response, status_code=200)
 
 
 @app.get("/hello", response_class=HTMLResponse)
@@ -65,7 +65,7 @@ def hello(nome: str = "visitante"):
     </body>
     </html>
     """
-    return HTMLResponse(content=html, status_code=200)
+    return HTMLResponse(content=html_response, status_code=200)
 
 
 # Execução local opcional:
