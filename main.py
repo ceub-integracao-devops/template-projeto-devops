@@ -24,7 +24,7 @@ def index():
         </style>
     </head>
     <body>
-        <h1>Bem-vindo(a)</h1>
+        <h1>Bem-vindo(a)!</h1>
         <p>Preencha seu nome para receber uma saudação.</p>
         <p> teste protecao branch main </p>
         <form action="/hello" method="get">
